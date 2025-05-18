@@ -88,8 +88,9 @@ def generate(input_text, approx_model_name, target_model_name, num_tokens=20, ga
              random_seed = None, verbose = False, use_benchmark = False, use_profiling = False):
     # NOTE() approx_model_name and target_model_name should use the same tokenizer!
     
-    torch_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
+    # torch_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    torch_device_1 = 'cuda:0'
+    torch_device_2 = 'cuda:1'
     # 加载approx_model:小模型， Target_model:大模型，不过分词表应该是同一个
     tokenizer = AutoTokenizer.from_pretrained(approx_model_name, trust_remote_code=True)
   
@@ -135,23 +136,22 @@ def generate(input_text, approx_model_name, target_model_name, num_tokens=20, ga
 
     torch.manual_seed(random_seed)
     
-    # 自回归采样
-    output = autoregressive_sampling(input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    color_print(f"large (target) model autoregressive_sampling: {generated_text}")
+    # 自回归采样, 大模型
+    # output = autoregressive_sampling(input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
+    # generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    # color_print(f"large (target) model autoregressive_sampling: {generated_text}")
     
     if use_benchmark:
-        benchmark(autoregressive_sampling, "AS_large", use_profiling,
-                  input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
+        benchmark(autoregressive_sampling, "AS_large", use_profiling, input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
 
     torch.manual_seed(random_seed)
-    output = autoregressive_sampling(input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    color_print(f"small (approx) model autoregressive_sampling: {generated_text}")
+    # 自回归采样, 小模型
+    # output = autoregressive_sampling(input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
+    # generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    # color_print(f"small (approx) model autoregressive_sampling: {generated_text}")
     
     if use_benchmark:
-        benchmark(autoregressive_sampling, "AS_small", use_profiling,
-                  input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
+        benchmark(autoregressive_sampling, "AS_small", use_profiling,input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
     
     torch.manual_seed(random_seed)
     
@@ -172,8 +172,7 @@ def generate(input_text, approx_model_name, target_model_name, num_tokens=20, ga
         color_print(f"Qwen适配版 google's speculative_sampling: {generated_text}")
         
         if use_benchmark:
-            benchmark(speculative_sampling_qwen, "SP_Qwen", use_profiling,
-                    input_ids, small_model, large_model, max_len = num_tokens, gamma = gamma, top_k = top_k, top_p=top_p, random_seed = random_seed, verbose = verbose)
+            benchmark(speculative_sampling_qwen, "SP_Qwen", use_profiling, input_ids, small_model, large_model, max_len = num_tokens, gamma = gamma, top_k = top_k, top_p=top_p, random_seed = random_seed, verbose = verbose)
     else:
         output = speculative_sampling(input_ids, small_model, large_model, num_tokens, gamma = gamma, top_k = top_k, top_p=top_p, random_seed = random_seed, verbose = verbose)
         generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
