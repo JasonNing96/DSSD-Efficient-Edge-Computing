@@ -12,28 +12,70 @@ class AlignedKVCacheModel(KVCacheModel):
         self.target_vocab_size = target_vocab_size
         self.original_vocab_size = None  # 将在第一次前向传播时确定
         
-    def _forward_with_kvcache(self, input_ids : torch.Tensor, use_debug = False) -> torch.Tensor:
-        # 调用父类方法获取结果
-        last_q = super()._forward_with_kvcache(input_ids, use_debug)
+    def _forward_with_kvcache(self, input_ids: torch.Tensor, use_debug=False) -> torch.Tensor:
+        # 不调用父类方法，完全重新实现
+        input_ids = input_ids.to(self._device)
         
-        # 如果需要对齐词表大小
-        if self.target_vocab_size is not None and self._prob_history is not None:
-            if self.original_vocab_size is None:
-                self.original_vocab_size = self._prob_history.shape[-1]
+        if self._past_key_values is None:
+            # 首次前向传播
+            outputs = self._model(input_ids)
+            logits = outputs.logits
             
-            # 如果词表大小不同，进行对齐
-            if self.original_vocab_size != self.target_vocab_size:
-                # 获取较小的词表大小
-                aligned_size = min(self.original_vocab_size, self.target_vocab_size)
+            # 确保词表大小一致
+            if self.target_vocab_size is not None:
+                if self.original_vocab_size is None:
+                    self.original_vocab_size = logits.shape[-1]
                 
-                # 截断概率分布
-                self._prob_history = self._prob_history[..., :aligned_size]
-                # 重新归一化
-                self._prob_history = self._prob_history / self._prob_history.sum(dim=-1, keepdim=True)
+                if self.original_vocab_size != self.target_vocab_size:
+                    logits = logits[..., :self.target_vocab_size]
+                    # 可选: 归一化
+                    logits = logits / logits.sum(dim=-1, keepdim=True)
+            
+            self._prob_history = logits
+            for i in range(self._prob_history.shape[-2]):   
+                self._prob_history[:, i, :] = norm_logits(self._prob_history[:, i, :], 
+                                                        self._temperature, self._top_k, self._top_p)
+            self._past_key_values = outputs.past_key_values
+            last_q = self._prob_history[:, -1, :]
+        else:
+            # 增量前向传播
+            # 计算缓存长度
+            cached_len = 0
+            for kv in self._past_key_values:
+                k, v = kv
+                cached_len = k.shape[2]
+            
+            last_input_id = input_ids[:, cached_len:]
+            if last_input_id.dim() == 1:
+                last_input_id = torch.unsqueeze(last_input_id, 0)
+            
+            last_input_id = last_input_id.to(self._device)
+            
+            outputs = self._model(last_input_id, past_key_values=self._past_key_values, use_cache=True)
+            
+            not_cached_q = outputs.logits
+            if not_cached_q.dim() == 2:
+                not_cached_q = torch.unsqueeze(not_cached_q, 0)
+            
+            # 处理词表大小
+            if self.target_vocab_size is not None:
+                if self.original_vocab_size is None:
+                    self.original_vocab_size = not_cached_q.shape[-1]
                 
-                # 同样处理last_q
-                last_q = last_q[..., :aligned_size]
-                last_q = last_q / last_q.sum(dim=-1, keepdim=True)
+                if self.original_vocab_size != self.target_vocab_size:
+                    not_cached_q = not_cached_q[..., :self.target_vocab_size]
+                    # 可选: 归一化
+                    not_cached_q = not_cached_q / not_cached_q.sum(dim=-1, keepdim=True)
+            
+            for i in range(not_cached_q.shape[-2]):   
+                not_cached_q[:, i, :] = norm_logits(not_cached_q[:, i, :], 
+                                                self._temperature, self._top_k, self._top_p)
+            
+            # 现在两者维度应该一致，可以安全连接
+            self._prob_history = torch.cat([self._prob_history, not_cached_q], dim=1)
+            
+            last_q = not_cached_q[:, -1, :]
+            self._past_key_values = outputs.past_key_values
         
         return last_q
 
@@ -45,7 +87,7 @@ def speculative_sampling_qwen(
         max_len: int,
         gamma: int = 4,
         temperature: float = 1,
-        top_k: int = 0,
+        D: int = 0,
         top_p: float = 0,
         verbose: bool = False,
         random_seed: int = None
@@ -74,6 +116,9 @@ def speculative_sampling_qwen(
     target_cache.reset_cache()
     approx_cache.generate(prefix, 0)        # 仅建立 KV
     target_cache.generate(prefix, 0)
+    
+    _ = approx_cache._forward_with_kvcache(prefix)
+    _ = target_cache._forward_with_kvcache(prefix)
 
     accepted_cnt = resample_cnt = target_cnt = 0
 

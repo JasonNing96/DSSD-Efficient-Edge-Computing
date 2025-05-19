@@ -12,5 +12,5 @@ CUDA_VISIBLE_DEVICES=2 python main.py \
     --target_model_name /home/ningjiahong/LLM/Qwen2.5-14B-Instruct/ \
     --approx_model_name /home/ningjiahong/LLM/Qwen2.5-0.5B-Instruct/ \
     --max_tokens 240 \
-    --gamma 8 \
+    --gamma 4 \
     --seed 42

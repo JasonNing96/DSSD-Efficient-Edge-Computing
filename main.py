@@ -137,18 +137,18 @@ def generate(input_text, approx_model_name, target_model_name, num_tokens=20, ga
     torch.manual_seed(random_seed)
     
     # 自回归采样, 大模型
-    # output = autoregressive_sampling(input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
-    # generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    # color_print(f"large (target) model autoregressive_sampling: {generated_text}")
+    output = autoregressive_sampling(input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    color_print(f"large (target) model autoregressive_sampling: {generated_text}")
     
     if use_benchmark:
         benchmark(autoregressive_sampling, "AS_large", use_profiling, input_ids, large_model, num_tokens, top_k = top_k, top_p=top_p)
 
     torch.manual_seed(random_seed)
     # 自回归采样, 小模型
-    # output = autoregressive_sampling(input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
-    # generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    # color_print(f"small (approx) model autoregressive_sampling: {generated_text}")
+    output = autoregressive_sampling(input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    color_print(f"small (approx) model autoregressive_sampling: {generated_text}")
     
     if use_benchmark:
         benchmark(autoregressive_sampling, "AS_small", use_profiling,input_ids, small_model, num_tokens, top_k = top_k, top_p=top_p)
