@@ -1,10 +1,10 @@
-CUDA_VISIBLE_DEVICES=4 python main.py \
+CUDA_VISIBLE_DEVICES=0,1 python main.py \
     --input "How to make a good cup of coffee?" \
-    --target_model_name /home/ningjiahong/LLM/AI-ModelScope/bloomz-7b1/ \
-    --approx_model_name /home/ningjiahong/LLM/bloomz-560m/AI-ModelScope/bloom-560m/ \
-    --max_tokens 128 \
-    --gamma 7 \
-    --verbose \
+    --target_model_name ./LLM/opt-125m \
+    --approx_model_name ./LLM/opt-125m \
+    --max_tokens 100 \
+    --gamma 4 \
+    --benchmark \
     --seed 42
 
 CUDA_VISIBLE_DEVICES=2 python main.py \

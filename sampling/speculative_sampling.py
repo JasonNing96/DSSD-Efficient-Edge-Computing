@@ -58,7 +58,7 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
         prefix_len = prefix.shape[1]
 
         x = approx_model_cache.generate(prefix, gamma)
-        _ = target_model_cache.generate(x, 1)
+        _ = target_model_cache.generate(x, 0)
         # prefix 已经token化了，不需要传token，只需要传tensor就可以了
         n = prefix_len + gamma - 1
         
@@ -67,7 +67,7 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
             if random_seed:
                 torch.manual_seed(random_seed)
             r = torch.rand(1, device = device)
-            j = x[:, prefix_len + i]
+            j = x[:, prefix_len + i-1]
             
             # 拒接采样接受，跟deepmind的版本的逻辑是一样的，表述不同
             if r > (target_model_cache._prob_history[:, prefix_len + i - 1, j]) / (approx_model_cache._prob_history[:, prefix_len + i - 1, j]):
