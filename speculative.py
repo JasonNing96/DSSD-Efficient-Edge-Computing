@@ -5,20 +5,6 @@ from torch.nn import functional as F
 import argparse
 import time
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='args')
-
-    parser.add_argument('--input', type=str, default="Alan Turing theorized that computers would one day become ")
-    parser.add_argument('--draft_model_name', type=str, default="./LLM/opt-125m")
-    parser.add_argument('--target_model_name', type=str, default="./LLM/opt-1.3b") 
-    parser.add_argument('--max_len', type=int, default=100) 
-    parser.add_argument('--verbose', type=bool, default=False)
-    parser.add_argument('--seed', type=int, default=321)
-    # parser.add_argument('--benchmark', type=bool, default=False)
-    parser.add_argument('--gamma', type=int, default=4)
-    
-    args = parser.parse_args()
-    return args
 
 def top_k_top_p_filter(logits, top_k: int = 0, top_p: float = 0.0):
     if top_k > 0:
@@ -67,8 +53,8 @@ def autoregressive_sampling(prefix : torch.Tensor, model : torch.nn.Module, max_
             n += 1
             pbar.update(1)
     t2 = time.time()
-    print(f"autoregressive throughput: {T / (t2 - t1)} tokens/s", 'time_cost: ', t2 - t1, 'generated_length: ', len(T))
-    return prefix, (t2 - t1), len(T)
+    print(f"autoregressive throughput: {T / (t2 - t1)} tokens/s", 'time_cost: ', t2 - t1, 'generated_length: ', T)
+    return prefix, (t2 - t1), T, T / (t2 - t1)
 
 def max_fn(x):
     """
@@ -216,13 +202,13 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
                         
             # print(f"n : {n}, i : {i}, prefix_len + gamma - 1: {prefix_len + gamma - 1}")
             assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
-            prefix = x[:, :n + 1]
+            prefix = x[:, :n + 1]               # 更新prefix,回滚
 
             if n < prefix_len + gamma - 1:                       # 回滚逻辑
                 # reject someone, sample from the pos n
                 # print(f"sum on {n}: {torch.sum(p[:, n, :])}, {torch.sum(q[:, n, :])}")
                 t = sample(max_fn(p[:, n, :] - q[:, n, :]), temperature, top_k, top_p)
-                # print(f"reject and sample {n}")
+                # print(f"reject and sample {n}")， 直接采样概率更大的那个p
             else:
                 # all draft model decoding accepted
                 assert n == p.shape[1] - 1
@@ -234,8 +220,8 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
     total_samples = accepted_count + rejected_count
     acceptance_rate = accepted_count / total_samples
     print('Acceptance rate: ', acceptance_rate, 'Accept: ', accepted_count, 'Reject: ', rejected_count)
-    print(f"speculative sampling throughput: {T / (t2 - t1)} tokens/s", 'time_cost: ', t2 - t1, 'generated_length: ', len(T))
-    return prefix, (t2 - t1), len(T), acceptance_rate
+    print(f"speculative sampling throughput: {T / (t2 - t1)} tokens/s", 'time_cost: ', t2 - t1, 'generated_length: ', T)
+    return prefix, (t2 - t1), T, acceptance_rate, T / (t2 - t1)
 
 def generate(input_text, draft_model_name, target_model_name, max_len=20, verbose=False, seed=123, benchmark=False, gamma=4):
 
@@ -249,17 +235,34 @@ def generate(input_text, draft_model_name, target_model_name, max_len=20, verbos
 
 
     torch.manual_seed(seed)
-    output = speculative_sampling(input_ids, small_model, large_model, max_len, gamma = gamma)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    print(f"speculative_sampling: {generated_text}")
+    sp_text, sp_time, sp_len, sp_acceptance_rate, sp_throughput = speculative_sampling_with_acceptance_rate(input_ids, small_model, large_model, max_len, gamma = gamma)
+    generated_text = tokenizer.decode(sp_text[0], skip_special_tokens=True)
+    # print(f"speculative_sampling: {generated_text}")
+    print(f"speculative throughput: \033[91m{sp_throughput}\033[0m")
 
 
     torch.manual_seed(seed)
-    output = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    print(f"autoregressive_sampling: {generated_text}")
+    ag_text, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7)
+    generated_text = tokenizer.decode(ag_text[0], skip_special_tokens=True)
+    # print(f"autoregressive_sampling: {generated_text}")
+    print(f"autoregressive throughput: \033[91m{ag_throughput}\033[0m")
+
+    # torch.manual_seed(seed)
+    agsm_text, agsm_time, agsm_len, agsm_throughput = autoregressive_sampling(input_ids, small_model, max_len, top_k = 10, temperature=0.7)
+    generated_text = tokenizer.decode(agsm_text[0], skip_special_tokens=True)
+    # print(f"speculative_sampling: {generated_text}")
+    print(f"speculative throughput: \033[91m{agsm_throughput}\033[0m")
 
 if __name__ == "__main__":
-    args = parse_arguments()
+    parser = argparse.ArgumentParser(description='args')
+    parser.add_argument('--input', type=str, default="Alan Turing theorized that computers would one day become ")
+    parser.add_argument('--draft_model_name', type=str, default="./LLM/opt-125m")
+    parser.add_argument('--target_model_name', type=str, default="./LLM/opt-1.3b") 
+    parser.add_argument('--max_len', type=int, default=60) 
+    parser.add_argument('--verbose', type=bool, default=False)
+    parser.add_argument('--seed', type=int, default=321)
+    parser.add_argument('--benchmark', type=bool, default=False)
+    parser.add_argument('--gamma', type=int, default=4)
+    args = parser.parse_args()
     
     generate(args.input, args.draft_model_name, args.target_model_name, args.max_len, args.verbose, args.seed, args.benchmark, args.gamma)
