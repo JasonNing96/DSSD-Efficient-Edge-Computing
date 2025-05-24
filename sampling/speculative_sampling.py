@@ -4,6 +4,7 @@ import torch
 from sampling.kvcache_model import KVCacheModel
 from sampling.utils import norm_logits, sample, max_fn
 from globals import Decoder
+import time
 
 @torch.no_grad()
 def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, 
@@ -57,8 +58,13 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
         # q = M_q[prefix + x_0, x_1, .., x_(gamma-2)]
         prefix_len = prefix.shape[1]
 
-        x = approx_model_cache.generate(prefix, gamma)
+        t1 = time.time()
+        x = approx_model_cache.generate(prefix, gamma)  
+        t2 = time.time()
+        # print(f"approx_model_cache.generate time: {t2 - t1}")
         _ = target_model_cache.generate(x, 0)
+        t3 = time.time()
+        # print(f"target_model_cache.generate time: {t3 - t2}")
         # prefix 已经token化了，不需要传token，只需要传tensor就可以了
         n = prefix_len + gamma - 1
         
@@ -84,7 +90,11 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
         assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
         prefix = x[:, :n + 1]
         
+        t4 = time.time()
+        # print(f"approx_model_cache.rollback time: {t4 - t3}")
         approx_model_cache.rollback(n+1)
+        t5 = time.time()
+        # print(f"approx_model_cache.rollback time: {t5 - t4}")
         
         assert approx_model_cache._prob_history.shape[-2] <= n + 1, f"approx_model prob list shape {approx_model_cache._prob_history.shape}, n {n}"
         
