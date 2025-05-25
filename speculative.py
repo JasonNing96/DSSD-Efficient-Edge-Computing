@@ -95,23 +95,23 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
             # q = M_q[prefix + x_0, x_1, .., x_(gamma-2)]
             x = prefix
             prefix_len = prefix.shape[1]
-            for _ in range(gamma):
+            for _ in range(gamma):                       # 小模型生成gamma个token
                 # p.logits shape (batch, seq, vocab)
-                q = approx_model(x).logits
+                q = approx_model(x).logits               # 小模型单次生成token的概率分布
                 next_tok = sample(q[:, -1, :], 
                                   temperature, top_k, top_p)
-                x = torch.cat((x, next_tok), dim=1)
+                x = torch.cat((x, next_tok), dim=1)      # 将小模型生成的token加入到prefix中
 
-            q = norm_logits(q)
+            q = norm_logits(q)                          # 小模型单次生成token的概率分布归一化
             # p  = M_p[prefix + x_0, x_0, .., x_(gamma-1)]
-            p = norm_logits(target_model(x).logits)
+            p = norm_logits(target_model(x).logits)      # 大模型单次生成token的概率分布
 
             # n the end position of the valid prefix
             # x = x_[:prefix_len-1] + x_0, ... x_(gamma-1)
-            n = prefix_len + gamma - 1
-            for i in range(gamma):
-                r = torch.rand(1)
-                j = x[:, prefix_len + i]
+            n = prefix_len + gamma - 1                   # 大模型生成token的结束位置
+            for i in range(gamma):                       # 开始确认逻辑
+                r = torch.rand(1)                        # 生成一个随机数
+                j = x[:, prefix_len + i]                 # 获取大模型生成token的位置
                 # print(f"sum on {prefix_len + i - 1}: {torch.sum(p[:, prefix_len + i - 1, :])}, {torch.sum(q[:, prefix_len + i - 1, :])}")
 
                 if r > (p[:, prefix_len + i - 1, j]) / (q[:, prefix_len + i - 1, j]):
@@ -123,13 +123,13 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
             assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
             prefix = x[:, :n + 1]
 
-            if n < prefix_len + gamma - 1:
+            if n < prefix_len + gamma - 1:               # 回滚逻辑 
                 # reject someone, sample from the pos n
                 # print(f"sum on {n}: {torch.sum(p[:, n, :])}, {torch.sum(q[:, n, :])}")
                 t = sample(max_fn(p[:, n, :] - q[:, n, :]), 
                            temperature, top_k, top_p)
                 # print(f"reject and sample {n}")
-            else:
+            else:                                        # 所有小模型生成的token都被接受
                 # all draft model decoding accepted
                 assert n == p.shape[1] - 1
                 t = sample(p[:, -1, :], 
@@ -207,7 +207,7 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
             if n < prefix_len + gamma - 1:                       # 回滚逻辑
                 # reject someone, sample from the pos n
                 # print(f"sum on {n}: {torch.sum(p[:, n, :])}, {torch.sum(q[:, n, :])}")
-                t = sample(max_fn(p[:, n, :] - q[:, n, :]), temperature, top_k, top_p)
+                t = sample(max_fn(p[:, n, :] - q[:, n, :]), temperature, top_k, top_p)              # 差分采样
                 # print(f"reject and sample {n}")， 直接采样概率更大的那个p
             else:
                 # all draft model decoding accepted
