@@ -34,79 +34,62 @@ def transmission_simulator(token_count: int, rtt: float, bandwidth: float) -> fl
     serialize = token_count / bandwidth
     return rtt / 2 + serialize
 
-def draft_step(slm: torch.nn.Module,
-               prefix: torch.Tensor,
-               gamma: int,
-               temperature: float,
-               top_k: int,
-               top_p: float,
-               device: torch.device):
+def draft_step(slm, prefix, gamma, temperature, device, top_k, top_p):
     """
-    在 device 上用小模型连采 γ 步，返回拼好的序列 x_draft
-    以及最后一次小模型前向的完整 logits q_full_logits (1, T+γ, V)
+    返回：
+      x_draft            : (1, prefix_len+γ)
+      q_step_logits_stack: (γ, V)  —— 第 i 行对应 p 行 (prefix_len+i-1)
     """
     x = prefix.to(device)
+    q_stack = []                 # 用 list 依次 push
     with torch.no_grad():
         for _ in range(gamma):
-            logits = slm(x).logits                   # (1, seq, V)
-            next_tok = sample(logits[:, -1, :], temperature, top_k, top_p)
+            logits = slm(x).logits            # (1, seq, V)
+            q_stack.append(logits[0, -1].cpu())   # 只存最后一行 (V,)
+            next_tok = sample(logits[:, -1, :],
+                              temperature, top_k, top_p)  # 不做 top-k / top-p
             x = torch.cat((x, next_tok), dim=1)
-        # “最后一次” logits 已经是对整个 x 的前向结果
-        q_full_logits = logits                    # (1, seq+γ, V)
-    return x, q_full_logits
+    q_step_logits = torch.stack(q_stack, dim=0)    # -> (γ, V)
+    return x, q_step_logits
 
 
 
-def verify_step(llm: torch.nn.Module,
-                x_draft: torch.Tensor,
-                q_logits: torch.Tensor,   # 来自 draft_step，shape (1, prefix_len+γ-1, V)
-                gamma: int,
-                temperature: float,
-                device: torch.device):
+def verify_step(llm, x_draft, q_steps, gamma, temperature, device):
     """
-    只验证前 gamma-1 个 proposal，用 q_logits 里已有的时序，
-    最后一个 proposal 直接从 p_full 上采样。
+    q_steps: (γ, V) — 行 0..γ-1 对应 p 的行 prefix_len-1 .. prefix_len+γ-2
     """
-    x_l = x_draft.to(device)
-    with torch.no_grad():
-        p_full = llm(x_l).logits                 # -> (1, prefix+γ, V)
+    prefix_len = x_draft.size(1) - gamma          # t 起点
+    # 1) 大模型一次前向
+    p_all = llm(x_draft.to(device)).logits.cpu()   # (1, prefix_len+γ, V)
+    p_slice = p_all[0, prefix_len-1 : prefix_len+gamma-1, :]  # 取 γ 行 -> (γ, V)
 
-    # 归一化
-    p = F.softmax(p_full   / temperature, dim=-1)      # (1, prefix+γ, V)
-    q = F.softmax(q_logits / temperature, dim=-1)      # (1, prefix+γ-1, V)
+    # 2) softmax
+    p_probs = F.softmax(p_slice / temperature, dim=-1)  # (γ, V)
+    q_probs = F.softmax(q_steps / temperature,   dim=-1)  # (γ, V)
 
-    prefix_len = x_draft.size(1) - gamma
-    n = prefix_len - 1
-
-    # 只验证前 gamma-1 步
-    for i in range(gamma - 1):
-        t = prefix_len + i
-        tok_id = int(x_draft[0, t].item())
-        p_val = p[0, t, tok_id].detach().cpu()
-        q_val = q[0, t, tok_id].detach().cpu()
-        if torch.rand(1).item() > (p_val / q_val):
-            # 在第 i 步被拒绝
-            n = t - 1
-            diff = (p[0, t].detach().cpu() - q[0, t].detach().cpu()).clamp(min=0)
-            diff /= diff.sum()
-            t_corr = torch.multinomial(diff, 1).unsqueeze(0)  # shape (1,1)
+    # 3) accept / reject
+    for i in range(gamma):
+        tok_id = int(x_draft[0, prefix_len+i].item())
+        if torch.rand(1).item() > (p_probs[i, tok_id] / q_probs[i, tok_id]):
+            # 首拒绝 → 回滚到 prefix_len+i-1
+            n = prefix_len + i - 1
+            diff = (p_probs[i] - q_probs[i]).clamp(min=0)
+            diff = diff / diff.sum()
+            t_corr = torch.multinomial(diff, 1).unsqueeze(0)   # (1,1)
             return n, t_corr
-
-    # 前 gamma-1 步都通过了，把最后一步当 accept：
-    # 回滚到 prefix_len + (γ-1) - 1 = prefix_len+γ-2
-    n = prefix_len + gamma - 2
-    # 在真正的最后时刻 t_last = prefix_len+γ-1 上采样
-    t_last = prefix_len + gamma - 1
-    diff = p[0, t_last]  # 直接用大模型分布
-    t_corr = torch.multinomial(diff, 1).unsqueeze(0)    # (1,1)
+    # 全通过：n = 最后行
+    n = prefix_len + gamma - 1
+    prob_last = F.softmax(p_all[0, n] / temperature, dim=-1)  # 归一化成概率
+    t_corr    = torch.multinomial(prob_last, 1).unsqueeze(0)  # shape (1,1)
     return n, t_corr
 
 def normal_generate( small_model, large_model,tokenizer, input_ids, device):
     print("Baseline autoregressive:")
+    input_ids = input_ids.to(device)
     _prefix, t_ar, _, tp_ar = autoregressive_sampling(
-        input_ids.to(device), large_model,
+        input_ids, large_model,
         args.max_len,
-        args.temperature, args.top_k, args.top_p)
+        args.temperature, args.top_k, args.top_p, device)
     
     print('text: ', tokenizer.decode(_prefix[0], skip_special_tokens=True))
     print(f"  throughput_base: {tp_ar:.4f}")
@@ -130,7 +113,7 @@ def generate_with_sp(draft_model: torch.nn.Module,
 
     torch.manual_seed(args.seed)
     # 局部维护 prefix，而不再直接修改 input_ids
-    prefix = input_ids.to(device_1)
+    prefix = input_ids
 
     # 2) 进度条循环
     with tqdm(total=max_total_len, desc="speculative sampling") as pbar:
@@ -148,10 +131,11 @@ def generate_with_sp(draft_model: torch.nn.Module,
 
             # 2.1) UAV 端：草稿 gamma 步
             x_draft, q_probs = draft_step(
-                draft_model, prefix,
+                draft_model, prefix,    
                 args.gamma, args.temperature,
-                args.top_k, args.top_p,
-                device=device_1
+                device=device_1,
+                top_k=args.top_k,
+                top_p=args.top_p
             )
 
             # 模拟上行延迟，并累加
@@ -207,7 +191,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
     draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name).to(device_1)
     target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_2)
-    input_ids = tokenizer.encode(args.input, return_tensors='pt')
+    input_ids = tokenizer.encode(args.input, return_tensors='pt').to(device_1)
     
     # normal_generate()
     generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)

@@ -41,15 +41,15 @@ def sample(logits : torch.Tensor, temperature : float, top_k : float, top_p : fl
     return idx_next
 
 
-def autoregressive_sampling(prefix : torch.Tensor, model : torch.nn.Module, max_len : int, temperature : float = 1, top_k : int = 0, top_p : float = 0):
+def autoregressive_sampling(prefix : torch.Tensor, model : torch.nn.Module, max_len : int, temperature : float = 1, top_k : int = 0, top_p : float = 0, device : str = 'cuda:0'):
     n = len(prefix)
     T = len(prefix) + max_len
     t1 = time.time()
     with tqdm(total=max_len, desc="autoregressive sampling") as pbar:
         while n < T:
-            logits = model(prefix).logits[::, -1, :]
-            idx_next = sample(logits, temperature, top_k, top_p)
-            prefix = torch.cat((prefix, idx_next), dim=1)
+            logits = model(prefix).logits[::, -1, :].to(device)
+            idx_next = sample(logits, temperature, top_k, top_p).to(device)
+            prefix = torch.cat((prefix, idx_next), dim=1).to(device)
             n += 1
             pbar.update(1)
     t2 = time.time()
@@ -142,7 +142,7 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
     return prefix, t2 - t1
 
 
-def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, max_len : int , gamma : int = 4, temperature : float = 1, top_k : int = 0, top_p : float = 0, verbose : bool = False) -> torch.Tensor:
+def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, max_len : int , gamma : int = 4, temperature : float = 1, top_k : int = 0, top_p : float = 0, verbose : bool = False, device : str = 'cuda:0') -> torch.Tensor:
     """
     Args:
         x (torch.Tensor): input sequence, (batch, prefix_seqlen), Note that the batch dim is always 1 now.
@@ -168,24 +168,24 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
     with tqdm(total=T, desc="speculative sampling") as pbar:
         while prefix.shape[1] < T:
             # q = M_q[prefix + x_0, x_1, .., x_(gamma-2)]
-            x = prefix
-            prefix_len = prefix.shape[1]
+            x = prefix.to(device)
+            prefix_len = prefix.shape[1]        
             for _ in range(gamma):
                 # p.logits shape (batch, seq, vocab)
-                q = approx_model(x).logits                      # 小模型单次生成token的概率分布
+                q = (approx_model(x).logits)                  # 小模型单次生成token的概率分布
                 next_tok = sample(q[:, -1, :], 
-                                  temperature, top_k, top_p)    # 小模型单次生成token
-                x = torch.cat((x, next_tok), dim=1)              # 将小模型生成的token加入到prefix中
+                                  temperature, top_k, top_p).to(device)    # 小模型单次生成token
+                x = torch.cat((x, next_tok), dim=1).to(device)              # 将小模型生成的token加入到prefix中
 
-            q = norm_logits(q)                                  # 小模型单次生成token的概率分布归一化
+            q = norm_logits(q).to(device)                             # 小模型单次生成token的概率分布归一化
             # p  = M_p[prefix + x_0, x_0, .., x_(gamma-1)]
-            p = norm_logits(target_model(x).logits)             # 大模型单次生成token的概率分布(这部分没有使用cache)
+            p = norm_logits(target_model(x).logits).to(device)             # 大模型单次生成token的概率分布(这部分没有使用cache)
 
             # n the end position of the valid prefix
             # x = x_[:prefix_len-1] + x_0, ... x_(gamma-1)
             n = prefix_len + gamma - 1                          # 大模型生成token的结束位置
             for i in range(gamma):                              # 开始投机采样拒绝
-                r = torch.rand(1)                                # 生成一个随机数
+                r = torch.rand(1).to(device)                                # 生成一个随机数
                 j = x[:, prefix_len + i]                         # 获取大模型生成token的位置
                 # print(f"sum on {prefix_len + i - 1}: {torch.sum(p[:, prefix_len + i - 1, :])}, {torch.sum(q[:, prefix_len + i - 1, :])}")
 
@@ -212,9 +212,9 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
             else:
                 # all draft model decoding accepted
                 assert n == p.shape[1] - 1
-                t = sample(p[:, -1, :], temperature, top_k, top_p)
+                t = sample(p[:, -1, :], temperature, top_k, top_p).to(device)
 
-            prefix = torch.cat((prefix, t), dim=1)
+            prefix = torch.cat((prefix, t), dim=1).to(device)  
             pbar.update(n - pbar.n)
     t2 = time.time()
     total_samples = accepted_count + rejected_count
@@ -223,35 +223,34 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
     print(f"speculative sampling throughput: {T / (t2 - t1)} tokens/s", 'time_cost: ', t2 - t1, 'generated_length: ', T)
     return prefix, (t2 - t1), T, acceptance_rate, T / (t2 - t1)
 
-def generate(input_text, draft_model_name, target_model_name, max_len=20, verbose=False, seed=123, benchmark=False, gamma=4):
-
+def generate(input_text, draft_model_name, target_model_name, max_len=20, verbose=False, seed=123, benchmark=False, gamma=4, device='cuda:0'):
     # NOTE() draft_model_name and target_model_name should use the same tokenizer!
     tokenizer = AutoTokenizer.from_pretrained(draft_model_name)
 
-    small_model = AutoModelForCausalLM.from_pretrained(draft_model_name)
-    large_model = AutoModelForCausalLM.from_pretrained(target_model_name)
+    small_model = AutoModelForCausalLM.from_pretrained(draft_model_name).to(device)
+    large_model = AutoModelForCausalLM.from_pretrained(target_model_name).to(device)
 
-    input_ids = tokenizer.encode(input_text, return_tensors='pt')
+    input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
 
 
     torch.manual_seed(seed)
-    sp_text, sp_time, sp_len, sp_acceptance_rate, sp_throughput = speculative_sampling_with_acceptance_rate(input_ids, small_model, large_model, max_len, gamma = gamma)
+    sp_text, sp_time, sp_len, sp_acceptance_rate, sp_throughput = speculative_sampling_with_acceptance_rate(input_ids, small_model, large_model, max_len, gamma = gamma, device=device)
     generated_text = tokenizer.decode(sp_text[0], skip_special_tokens=True)
     # print(f"speculative_sampling: {generated_text}")
     print(f"speculative throughput: \033[91m{sp_throughput}\033[0m")
 
 
     torch.manual_seed(seed)
-    ag_text, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7)
+    ag_text, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7, device=device)
     generated_text = tokenizer.decode(ag_text[0], skip_special_tokens=True)
     # print(f"autoregressive_sampling: {generated_text}")
     print(f"autoregressive throughput: \033[91m{ag_throughput}\033[0m")
 
-    # torch.manual_seed(seed)
-    agsm_text, agsm_time, agsm_len, agsm_throughput = autoregressive_sampling(input_ids, small_model, max_len, top_k = 10, temperature=0.7)
-    generated_text = tokenizer.decode(agsm_text[0], skip_special_tokens=True)
-    # print(f"speculative_sampling: {generated_text}")
-    print(f"speculative throughput: \033[91m{agsm_throughput}\033[0m")
+    # # torch.manual_seed(seed)
+    # agsm_text, agsm_time, agsm_len, agsm_throughput = autoregressive_sampling(input_ids, small_model, max_len, top_k = 10, temperature=0.7, device=device)
+    # generated_text = tokenizer.decode(agsm_text[0], skip_special_tokens=True)
+    # # print(f"speculative_sampling: {generated_text}")
+    # print(f"speculative throughput: \033[91m{agsm_throughput}\033[0m")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='args')
@@ -265,4 +264,4 @@ if __name__ == "__main__":
     parser.add_argument('--gamma', type=int, default=4)
     args = parser.parse_args()
     
-    generate(args.input, args.draft_model_name, args.target_model_name, args.max_len, args.verbose, args.seed, args.benchmark, args.gamma)
+    generate(args.input, args.draft_model_name, args.target_model_name, args.max_len, args.verbose, args.seed, args.benchmark, args.gamma, device='cpu')
