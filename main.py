@@ -40,72 +40,66 @@ def draft_step(slm: torch.nn.Module,
                temperature: float,
                top_k: int,
                top_p: float,
-               device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+               device: torch.device):
     """
-    Run small model for gamma steps, return extended sequence and q_logits for each step
+    在 device 上用小模型连采 γ 步，返回拼好的序列 x_draft
+    以及最后一次小模型前向的完整 logits q_full_logits (1, T+γ, V)
     """
     x = prefix.to(device)
-    # Collect q_probs for all proposals
-    q_probs = []
-    for _ in range(gamma):
-        logits = slm(x).logits           # (1, seq, vocab)
-        logits_last = logits[:, -1, :]
-        idx = sample(logits_last, temperature, top_k, top_p)
-        # store probability vector
-        q_probs.append(F.softmax(logits_last, dim=-1).detach().cpu())
-        x = torch.cat((x, idx), dim=1)
-    # Stack to shape (gamma, vocab)
-    q_probs = torch.stack(q_probs, dim=0)
-    return x, q_probs
+    with torch.no_grad():
+        for _ in range(gamma):
+            logits = slm(x).logits                   # (1, seq, V)
+            next_tok = sample(logits[:, -1, :], temperature, top_k, top_p)
+            x = torch.cat((x, next_tok), dim=1)
+        # “最后一次” logits 已经是对整个 x 的前向结果
+        q_full_logits = logits                    # (1, seq+γ, V)
+    return x, q_full_logits
 
-# ------------------------------------------------------------
-# Verify on LLM (large model) for one speculative batch
-# ------------------------------------------------------------
+
+
 def verify_step(llm: torch.nn.Module,
                 x_draft: torch.Tensor,
-                q_probs: torch.Tensor,     # (γ, 1, V)
+                q_logits: torch.Tensor,   # 来自 draft_step，shape (1, prefix_len+γ-1, V)
                 gamma: int,
                 temperature: float,
-                top_k: int,
-                top_p: float,
-                device: torch.device) -> Tuple[int, torch.Tensor]:
+                device: torch.device):
     """
-    Returns:
-      n: rollback index (int)
-      t: correction token of shape (1,1)
+    只验证前 gamma-1 个 proposal，用 q_logits 里已有的时序，
+    最后一个 proposal 直接从 p_full 上采样。
     """
-    # 1) 大模型前向 + 取 proposal 部分
     x_l = x_draft.to(device)
-    p_full  = llm(x_l).logits                                      # (1, seq+γ, V)
-    p_logits= p_full[:, -gamma-1:-1, :].detach().cpu().squeeze(0)  # (γ, V)
-    p_probs = F.softmax(p_logits / temperature, dim=-1)           # (γ, V)
+    with torch.no_grad():
+        p_full = llm(x_l).logits                 # -> (1, prefix+γ, V)
 
-    # 2) q_probs 从 (γ,1,V) -> (γ,V)
-    q_probs = q_probs.detach().cpu().squeeze(1)                   # (γ, V)
+    # 归一化
+    p = F.softmax(p_full   / temperature, dim=-1)      # (1, prefix+γ, V)
+    q = F.softmax(q_logits / temperature, dim=-1)      # (1, prefix+γ-1, V)
 
-    # 3) accept/reject
-    prefix_len = x_draft.shape[1] - gamma
+    prefix_len = x_draft.size(1) - gamma
     n = prefix_len - 1
-    for i in range(gamma):
-        tok_id = x_draft[0, prefix_len + i].cpu().item()
-        p_i = p_probs[i]   # (V,)
-        q_i = q_probs[i]   # (V,)
-        ratio = p_i[tok_id] / q_i[tok_id]
-        if torch.rand(1).item() > ratio:
-            # 拒绝：回滚 + 差分采样
-            n = prefix_len + i - 1
-            diff = (p_i - q_i).clamp(min=0)
-            diff = diff / diff.sum()
-            t = torch.multinomial(diff, num_samples=1)  # -> shape (1,)
-            t = t.unsqueeze(1)                          # -> shape (1,1)
-            return n, t
 
-    # 4) 全部接受：在最后一个 p_probs 上采样
-    n = prefix_len + gamma - 1
-    t = torch.multinomial(p_probs[-1], num_samples=1)  # (1,)
-    t = t.unsqueeze(1)                                 # (1,1)
-    return n, t
+    # 只验证前 gamma-1 步
+    for i in range(gamma - 1):
+        t = prefix_len + i
+        tok_id = int(x_draft[0, t].item())
+        p_val = p[0, t, tok_id].detach().cpu()
+        q_val = q[0, t, tok_id].detach().cpu()
+        if torch.rand(1).item() > (p_val / q_val):
+            # 在第 i 步被拒绝
+            n = t - 1
+            diff = (p[0, t].detach().cpu() - q[0, t].detach().cpu()).clamp(min=0)
+            diff /= diff.sum()
+            t_corr = torch.multinomial(diff, 1).unsqueeze(0)  # shape (1,1)
+            return n, t_corr
 
+    # 前 gamma-1 步都通过了，把最后一步当 accept：
+    # 回滚到 prefix_len + (γ-1) - 1 = prefix_len+γ-2
+    n = prefix_len + gamma - 2
+    # 在真正的最后时刻 t_last = prefix_len+γ-1 上采样
+    t_last = prefix_len + gamma - 1
+    diff = p[0, t_last]  # 直接用大模型分布
+    t_corr = torch.multinomial(diff, 1).unsqueeze(0)    # (1,1)
+    return n, t_corr
 
 def normal_generate( small_model, large_model,tokenizer, input_ids, device):
     print("Baseline autoregressive:")
@@ -113,6 +107,8 @@ def normal_generate( small_model, large_model,tokenizer, input_ids, device):
         input_ids.to(device), large_model,
         args.max_len,
         args.temperature, args.top_k, args.top_p)
+    
+    print('text: ', tokenizer.decode(_prefix[0], skip_special_tokens=True))
     print(f"  throughput_base: {tp_ar:.4f}")
     
     
@@ -171,7 +167,6 @@ def generate_with_sp(draft_model: torch.nn.Module,
             n, t_corr = verify_step(
                 target_model, x_draft, q_probs,
                 args.gamma, args.temperature,
-                args.top_k, args.top_p,
                 device=device_2
             )
 
@@ -211,9 +206,9 @@ if __name__ == "__main__":
     device_2 = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
     draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name).to(device_1)
-    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_1)
+    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_2)
     input_ids = tokenizer.encode(args.input, return_tensors='pt')
     
     # normal_generate()
     generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
-    normal_generate(draft_model, target_model, tokenizer, input_ids, device_1)
+    normal_generate(draft_model, target_model, tokenizer, input_ids, device_2)
