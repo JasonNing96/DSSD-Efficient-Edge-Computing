@@ -16,7 +16,12 @@
                 "--target_model_name", "./LLM/opt-1.3b",
                 "--max_len", "80",
                 "--gamma", "4",
-                "--seed", "42",
+                "--seed", "321",
+                "--temperature", "0.7",
+                "--top_k", "10",
+                "--top_p", "0",
+                "--bandwidth", "10000.0",
+                "--rtt", "0.01"
             ],
             "console": "integratedTerminal",
             "env": {

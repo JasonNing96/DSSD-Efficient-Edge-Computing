@@ -147,12 +147,12 @@ def distributed_speculative(slm: torch.nn.Module,
     # alpha = total_accept / (args.gamma * len(t_s_list))
     # b = T_c / T_s
     # c = T_s / T_l
-    return {
-        'throughput_dist': throughput,
-        'alpha': alpha,
-        'b': b,
-        'c': c
-    }
+    # return {
+    #     'throughput_dist': throughput,
+    #     'alpha': alpha,
+    #     'b': b,
+    #     'c': c
+    # }
 
 # ------------------------------------------------------------
 # Baseline autoregressive sampling (pure LLM)
@@ -181,7 +181,7 @@ def main():
     input_ids = tokenizer(args.input, return_tensors='pt').input_ids.to('cuda:0')
 
     # # Distributed speculative
-    dist_stats = distributed_speculative(slm, llm, input_ids, args)
+    # dist_stats = distributed_speculative(slm, llm, input_ids, args)
     # print("Distributed Speculative:")
     # for k,v in dist_stats.items(): print(f"  {k}: {v:.4f}")
 

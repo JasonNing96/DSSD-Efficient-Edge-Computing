@@ -207,7 +207,7 @@ def speculative_sampling_with_acceptance_rate(prefix : torch.Tensor, approx_mode
             if n < prefix_len + gamma - 1:                       # 回滚逻辑
                 # reject someone, sample from the pos n
                 # print(f"sum on {n}: {torch.sum(p[:, n, :])}, {torch.sum(q[:, n, :])}")
-                t = sample(max_fn(p[:, n, :] - q[:, n, :]), temperature, top_k, top_p)              # 差分采样
+                t = sample(max_fn(p[:, n, :] - q[:, n, :]), temperature, top_k, top_p)              
                 # print(f"reject and sample {n}")， 直接采样概率更大的那个p
             else:
                 # all draft model decoding accepted

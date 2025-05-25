@@ -13,7 +13,7 @@ def parse_arguments():
     parser.add_argument('--input', type=str, default="Alan Turing theorized that computers would one day become ")
     parser.add_argument('--draft_model_name', type=str, default="./LLM/opt-125m")
     parser.add_argument('--target_model_name', type=str, default="./LLM/opt-1.3b") 
-    parser.add_argument('--max_len', type=int, default=60) 
+    parser.add_argument('--max_len', type=int, default=80) 
     parser.add_argument('--verbose', type=bool, default=False)
     parser.add_argument('--seed', type=int, default=321)
     # parser.add_argument('--benchmark', type=bool, default=False)
@@ -107,29 +107,13 @@ def verify_step(llm: torch.nn.Module,
     return n, t
 
 
-def normal_generate():
-    args = parse_arguments()
-    
-    tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
-
-    small_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name)
-    large_model = AutoModelForCausalLM.from_pretrained(args.target_model_name)
-
-    input_ids = tokenizer.encode(args.input, return_tensors='pt')
-
-    torch.manual_seed(args.seed)
-    # output, sp_time, sp_len, sp_acceptance_rate, sp_throughput = speculative_sampling_with_acceptance_rate(input_ids, small_model, large_model, args.max_len, gamma = args.gamma)
-    # generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    # # print(f"speculative_sampling: {generated_text}")
-    # print(f"speculative throughput: \033[91m{sp_throughput}\033[0m")
-
-
-    torch.manual_seed(args.seed)
-    output, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, args.max_len, top_k = 10, temperature=0.7)
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    # print(f"autoregressive_sampling: {generated_text}")
-    print(f"autoregressive throughput: \033[91m{ag_throughput}\033[0m")
-    # print(f"speculative throughput / autoregressive throughput: \033[94m{sp_throughput/ag_throughput}\033[0m")
+def normal_generate( small_model, large_model,tokenizer, input_ids, device):
+    print("Baseline autoregressive:")
+    _prefix, t_ar, _, tp_ar = autoregressive_sampling(
+        input_ids.to(device), large_model,
+        args.max_len,
+        args.temperature, args.top_k, args.top_p)
+    print(f"  throughput_base: {tp_ar:.4f}")
     
     
 def generate_with_sp(draft_model: torch.nn.Module,
@@ -156,6 +140,12 @@ def generate_with_sp(draft_model: torch.nn.Module,
     with tqdm(total=max_total_len, desc="speculative sampling") as pbar:
         # 初始化进度条为已有的 prefix 长度
         pbar.update(prefix.shape[1])
+
+        initial_len       = prefix.shape[1]
+        total_proposals   = 0     # 累计尝试的 proposal 数
+        accepted_proposals= 0     # 累计被 accept 的 proposal 数
+        total_comm_time   = 0.0   # 累计模拟的通信时间
+        dsp_start         = time.time()
         
         while prefix.shape[1] < max_total_len:
             old_len = prefix.shape[1]
@@ -168,10 +158,14 @@ def generate_with_sp(draft_model: torch.nn.Module,
                 device=device_1
             )
 
-            # 模拟上行延迟
-            time.sleep(transmission_simulator(
-                x_draft.shape[1] - prefix.shape[1], rtt, bandwidth
-            ))
+            # 模拟上行延迟，并累加
+            delta = x_draft.shape[1] - prefix.shape[1]
+            t_up  = transmission_simulator(delta, rtt, bandwidth)
+            total_comm_time += t_up
+            time.sleep(t_up)
+
+            # 累计 proposal 数
+            total_proposals += delta
 
             # 2.2) BS 端：验证 + 回滚 + 差分采样
             n, t_corr = verify_step(
@@ -188,13 +182,23 @@ def generate_with_sp(draft_model: torch.nn.Module,
                 t_corr.to(device_1)
             ], dim=1)
 
+            accepted = (n - (old_len - 1))
+            accepted_proposals += accepted
+            
             # 2.4) 更新进度条
             new_len = prefix.shape[1]
             pbar.update(new_len - old_len)
+            
+    dsp_time = time.time() - dsp_start
+    total_tokens = prefix.shape[1] - initial_len
+    dsp_throughput = total_tokens / dsp_time
+    acceptance_rate = accepted_proposals / total_proposals if total_proposals > 0 else 0.0
 
-    # 3) 输出最终结果
     generated = tokenizer.decode(prefix[0], skip_special_tokens=True)
-    print(generated)
+    print("\n=== Distributed SP Results ===")
+    print(f"Generated text: \033[91m{generated}\033[0m")
+    print(f"Throughput : \033[91m{dsp_throughput}\033[0m", "DSP wall time", dsp_time, "Generated tokens", total_tokens, "Acceptance rate", acceptance_rate )
+    print(f"Acceptance rate  : \033[91m{acceptance_rate:.3f}\033[0m  ({accepted_proposals}/{total_proposals})")    
             
         
         
@@ -207,8 +211,9 @@ if __name__ == "__main__":
     device_2 = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
     draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name).to(device_1)
-    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_2)
+    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_1)
     input_ids = tokenizer.encode(args.input, return_tensors='pt')
     
     # normal_generate()
     generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
+    normal_generate(draft_model, target_model, tokenizer, input_ids, device_1)
