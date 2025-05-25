@@ -181,7 +181,7 @@ def main():
     input_ids = tokenizer(args.input, return_tensors='pt').input_ids.to('cuda:0')
 
     # # Distributed speculative
-    # dist_stats = distributed_speculative(slm, llm, input_ids, args)
+    dist_stats = distributed_speculative(slm, llm, input_ids, args)
     # print("Distributed Speculative:")
     # for k,v in dist_stats.items(): print(f"  {k}: {v:.4f}")
 

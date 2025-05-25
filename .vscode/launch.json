@@ -14,6 +14,9 @@
                 "Alan Turing theorized that computers would one day become ",
                 "--draft_model_name", "./LLM/opt-125m",
                 "--target_model_name", "./LLM/opt-1.3b",
+                "--max_len", "80",
+                "--gamma", "4",
+                "--seed", "42",
             ],
             "console": "integratedTerminal",
             "env": {

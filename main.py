@@ -132,40 +132,69 @@ def normal_generate():
     # print(f"speculative throughput / autoregressive throughput: \033[94m{sp_throughput/ag_throughput}\033[0m")
     
     
-def generate_with_sp(draft_model : torch.nn.Module, target_model : torch.nn.Module, input_ids : torch.Tensor, tokenizer : AutoTokenizer, device_1 : torch.device, device_2 : torch.device):
+def generate_with_sp(draft_model: torch.nn.Module,
+                     target_model: torch.nn.Module,
+                     input_ids: torch.Tensor,
+                     tokenizer: AutoTokenizer,
+                     device_1: torch.device,
+                     device_2: torch.device):
     '''
-    Args: T, b, c, rtt, bandwidth
+    分布式 Speculative Decoding 核心逻辑，只做投机采样。
     '''
     args = parse_arguments()
 
-    T = args.max_len + len(input_ids[0])
-    b = 0
-    c = 0
-    rtt = args.rtt
+    # 1) 准备
+    max_total_len = args.max_len + input_ids.shape[1]
+    rtt       = args.rtt
     bandwidth = args.bandwidth
-    accepted_count = 0
-    rejected_count = 0
 
     torch.manual_seed(args.seed)
-    t_draft_start = time.time()
-    # time.sleep(transmission_simulator(T, rtt, bandwidth))
-    
-    with tqdm(total=T, desc="speculative sampling") as pbar:
-        while input_ids.shape[1] < T:
-            x_draft, q_probs = draft_step(draft_model, input_ids, args.gamma, args.temperature, args.top_k, args.top_p, device=device_1)
-            time.sleep(transmission_simulator(T, rtt, bandwidth))
-            
-            n, t_corr = verify_step(target_model, x_draft, q_probs, args.gamma, args.temperature, args.top_k, args.top_p, device=device_2)
-            
-            prefix = torch.cat((x_draft[:, :n+1].to(device_1),
-                             t_corr.to(device_1)), dim=1)
+    # 局部维护 prefix，而不再直接修改 input_ids
+    prefix = input_ids.to(device_1)
 
-            # print(f"\033[91m{tokenizer.decode(prefix[0], skip_special_tokens=True)}\033[0m")
-            pbar.update(n)
-    
-    
-    text = tokenizer.decode(prefix[0], skip_special_tokens=True)
-    print(text)
+    # 2) 进度条循环
+    with tqdm(total=max_total_len, desc="speculative sampling") as pbar:
+        # 初始化进度条为已有的 prefix 长度
+        pbar.update(prefix.shape[1])
+        
+        while prefix.shape[1] < max_total_len:
+            old_len = prefix.shape[1]
+
+            # 2.1) UAV 端：草稿 gamma 步
+            x_draft, q_probs = draft_step(
+                draft_model, prefix,
+                args.gamma, args.temperature,
+                args.top_k, args.top_p,
+                device=device_1
+            )
+
+            # 模拟上行延迟
+            time.sleep(transmission_simulator(
+                x_draft.shape[1] - prefix.shape[1], rtt, bandwidth
+            ))
+
+            # 2.2) BS 端：验证 + 回滚 + 差分采样
+            n, t_corr = verify_step(
+                target_model, x_draft, q_probs,
+                args.gamma, args.temperature,
+                args.top_k, args.top_p,
+                device=device_2
+            )
+
+            # 2.3) UAV 端：截断 + 校正 token 拼接
+            # 注意：x_draft[:, :n+1] 已包含初始 prefix 和所有 accept 的 proposal
+            prefix = torch.cat([
+                x_draft[:, : n+1].to(device_1),
+                t_corr.to(device_1)
+            ], dim=1)
+
+            # 2.4) 更新进度条
+            new_len = prefix.shape[1]
+            pbar.update(new_len - old_len)
+
+    # 3) 输出最终结果
+    generated = tokenizer.decode(prefix[0], skip_special_tokens=True)
+    print(generated)
             
         
         
