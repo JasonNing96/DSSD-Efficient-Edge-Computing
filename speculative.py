@@ -41,15 +41,15 @@ def sample(logits : torch.Tensor, temperature : float, top_k : float, top_p : fl
     return idx_next
 
 
-def autoregressive_sampling(prefix : torch.Tensor, model : torch.nn.Module, max_len : int, temperature : float = 1, top_k : int = 0, top_p : float = 0, device : str = 'cuda:0'):
+def autoregressive_sampling(prefix : torch.Tensor, model : torch.nn.Module, max_len : int, temperature : float = 1, top_k : int = 0, top_p : float = 0):
     n = len(prefix)
     T = len(prefix) + max_len
     t1 = time.time()
     with tqdm(total=max_len, desc="autoregressive sampling") as pbar:
         while n < T:
-            logits = model(prefix).logits[::, -1, :].to(device)
-            idx_next = sample(logits, temperature, top_k, top_p).to(device)
-            prefix = torch.cat((prefix, idx_next), dim=1).to(device)
+            logits = model(prefix).logits[::, -1, :]
+            idx_next = sample(logits, temperature, top_k, top_p)
+            prefix = torch.cat((prefix, idx_next), dim=1)
             n += 1
             pbar.update(1)
     t2 = time.time()

@@ -6,6 +6,8 @@ from typing import Tuple, List, Dict
 import time
 import torch.nn.functional as F
 from tqdm import tqdm
+import csv, time, os, json
+from collections import OrderedDict
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='args')
@@ -25,6 +27,28 @@ def parse_arguments():
     parser.add_argument('--top_p', type=float, default=0)
 
     return parser.parse_args()
+
+class Recorder:
+    def __init__(self, csv_path="results.csv"):
+        self.rows = []
+        self.csv_path = csv_path
+
+    def add_entry(self, **kw):
+        # kw: model_s, model_l, gamma, rtt, bw, dsp_thr, base_thr, speedup,
+        #     b, c, accept_rate, T_comm, T_slm, T_llm, prompt_len
+        row = OrderedDict(kw)          # keep order
+        self.rows.append(row)
+        # append to disk incrementally
+        write_header = not os.path.exists(self.csv_path)
+        with open(self.csv_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=row.keys())
+            if write_header: w.writeheader()
+            w.writerow(row)
+
+    def summary(self):
+        print(json.dumps(self.rows, indent=2))
+        
+
 
 def transmission_simulator(token_count: int, rtt: float, bandwidth: float) -> float:
     """
@@ -83,29 +107,35 @@ def verify_step(llm, x_draft, q_steps, gamma, temperature, device):
     t_corr    = torch.multinomial(prob_last, 1).unsqueeze(0)  # shape (1,1)
     return n, t_corr
 
-def normal_generate( small_model, large_model,tokenizer, input_ids, device):
+def normal_generate( large_model, tokenizer, input_ids, device):
     print("Baseline autoregressive:")
     input_ids = input_ids.to(device)
     _prefix, t_ar, _, tp_ar = autoregressive_sampling(
-        input_ids, large_model,
+        input_ids, large_model.to(device),
         args.max_len,
-        args.temperature, args.top_k, args.top_p, device)
+        args.temperature, args.top_k, args.top_p)
     
     print('text: ', tokenizer.decode(_prefix[0], skip_special_tokens=True))
     print(f"  throughput_base: {tp_ar:.4f}")
+    return _prefix, t_ar, tp_ar
     
-    
-def generate_with_sp(draft_model: torch.nn.Module,
-                     target_model: torch.nn.Module,
-                     input_ids: torch.Tensor,
-                     tokenizer: AutoTokenizer,
-                     device_1: torch.device,
-                     device_2: torch.device):
+def generate_with_sp(draft_model,
+                     target_model,
+                     input_ids,
+                     tokenizer,
+                     device_1,
+                     device_2):
     '''
     分布式 Speculative Decoding 核心逻辑，只做投机采样。
     '''
+    input_ids = input_ids.to(device_1)
     args = parse_arguments()
-
+    draft_model = draft_model.to(device_1)
+    target_model = target_model.to(device_2)
+    
+    total_comm = total_slm = total_llm = 0.0
+    total_proposals = 0
+    
     # 1) 准备
     max_total_len = args.max_len + input_ids.shape[1]
     rtt       = args.rtt
@@ -121,15 +151,13 @@ def generate_with_sp(draft_model: torch.nn.Module,
         pbar.update(prefix.shape[1])
 
         initial_len       = prefix.shape[1]
-        total_proposals   = 0     # 累计尝试的 proposal 数
-        accepted_proposals= 0     # 累计被 accept 的 proposal 数
-        total_comm_time   = 0.0   # 累计模拟的通信时间
         dsp_start         = time.time()
         
         while prefix.shape[1] < max_total_len:
             old_len = prefix.shape[1]
 
             # 2.1) UAV 端：草稿 gamma 步
+            t0 = time.time()
             x_draft, q_probs = draft_step(
                 draft_model, prefix,    
                 args.gamma, args.temperature,
@@ -141,23 +169,26 @@ def generate_with_sp(draft_model: torch.nn.Module,
             # 模拟上行延迟，并累加
             delta = x_draft.shape[1] - prefix.shape[1]
             t_up  = transmission_simulator(delta, rtt, bandwidth)
-            total_comm_time += t_up
+            total_slm += time.time() - t0
+            total_comm += t_up
             time.sleep(t_up)
 
             # 累计 proposal 数
             total_proposals += delta
 
-            # 2.2) BS 端：验证 + 回滚 + 差分采样
+            # 2.2) BS 端：验证 + 回滚 + 差分采样 Vertify
+            t1 = time.time()
             n, t_corr = verify_step(
                 target_model, x_draft, q_probs,
                 args.gamma, args.temperature,
                 device=device_2
             )
-
+            total_llm += time.time() - t1
+            
             # 2.3) UAV 端：截断 + 校正 token 拼接
             # 注意：x_draft[:, :n+1] 已包含初始 prefix 和所有 accept 的 proposal
             prefix = torch.cat([
-                x_draft[:, : n+1].to(device_1),
+                x_draft[:, : n+1],
                 t_corr.to(device_1)
             ], dim=1)
 
@@ -172,27 +203,45 @@ def generate_with_sp(draft_model: torch.nn.Module,
     total_tokens = prefix.shape[1] - initial_len
     dsp_throughput = total_tokens / dsp_time
     acceptance_rate = accepted_proposals / total_proposals if total_proposals > 0 else 0.0
+    b_ratio  = total_comm / max(total_slm, 1e-4)
+    c_ratio  = dsp_time  / max(total_llm, 1e-4)
+    
 
     generated = tokenizer.decode(prefix[0], skip_special_tokens=True)
     print("\n=== Distributed SP Results ===")
     print(f"Generated text: \033[91m{generated}\033[0m")
     print(f"Throughput : \033[91m{dsp_throughput}\033[0m", "DSP wall time", dsp_time, "Generated tokens", total_tokens, "Acceptance rate", acceptance_rate )
     print(f"Acceptance rate  : \033[91m{acceptance_rate:.3f}\033[0m  ({accepted_proposals}/{total_proposals})")    
-            
-        
-        
     
-    
+    return generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio, c_ratio
+
+recorder = Recorder("results_1.3b.csv")
 
 if __name__ == "__main__":
     args = parse_arguments()
     device_1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device_2 = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
-    draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name).to(device_1)
-    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name).to(device_2)
-    input_ids = tokenizer.encode(args.input, return_tensors='pt').to(device_1)
+    draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name)
+    target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name)
+    input_ids = tokenizer.encode(args.input, return_tensors='pt')
     
     # normal_generate()
-    generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
-    normal_generate(draft_model, target_model, tokenizer, input_ids, device_2)
+    generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio, c_ratio = generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1='cuda:0', device_2='cuda:1')
+    
+    _prefix, t_ar, tp_ar = normal_generate(target_model, tokenizer, input_ids, device='cuda:2')
+    
+    recorder.add_entry(
+        model_s = args.draft_model_name,
+        model_l = args.target_model_name,
+        speedup = round(dsp_throughput/tp_ar, 2),
+        b       = round(b_ratio, 3),
+        c       = round(c_ratio, 3),
+        accept_rate = round(acceptance_rate, 3),
+        dsp_thr = round(dsp_throughput, 2),
+        base_thr= round(tp_ar, 2),
+        gamma   = args.gamma,
+        rtt_ms  = args.rtt*1e3,
+        bw_Mbps = args.bandwidth/1e6,
+        prompt_len = args.max_len
+    )
