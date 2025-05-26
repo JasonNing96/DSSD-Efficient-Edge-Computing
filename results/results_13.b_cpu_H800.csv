@@ -1,0 +1,2 @@
+model_s,model_l,speedup,b,c,accept_rate,dsp_thr,base_thr,slm_thr,gamma,rtt_ms,bw_Mbps,prompt_len,t_ar_slm,t_ar_llm
+opt-1.3b,opt-1.3b,0.06,0.0,22.7,1.0,1.69,28.55,1.26,2,0.0,10.0,128,102.7,4.52

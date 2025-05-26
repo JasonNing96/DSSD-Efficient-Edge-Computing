@@ -25,7 +25,10 @@ def parse_arguments():
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--top_k', type=int, default=10)
     parser.add_argument('--top_p', type=float, default=0)
-
+    parser.add_argument('--csv_path', type=str, default="results.csv")
+    parser.add_argument('--device_1', type=str, default="cuda:6")
+    parser.add_argument('--device_2', type=str, default="cuda:1")
+    parser.add_argument('--device', type=str, default="cuda:0")
     return parser.parse_args()
 
 class Recorder:
@@ -50,12 +53,17 @@ class Recorder:
         
 
 
-def transmission_simulator(token_count: int, rtt: float, bandwidth: float) -> float:
+def transmission_simulator(token_count: int, rtt: float, bandwidth: float, bits_per_token: int = 32) -> float:
     """
     One-way transmission delay: RTT/2 + serialization delay
     bandwidth: tokens per second
+    bits_per_token: bits per token (default is 32 bits)
     """
-    serialize = token_count / bandwidth
+    # 计算总比特数
+    total_bits = token_count * bits_per_token
+    
+    # 计算序列化延迟
+    serialize = total_bits / (bandwidth * bits_per_token)  # 带宽以 tokens/second 计算
     return rtt / 2 + serialize
 
 def draft_step(slm, prefix, gamma, temperature, device, top_k, top_p):
@@ -134,7 +142,7 @@ def generate_with_sp(draft_model,
     target_model = target_model.to(device_2)
     
     total_comm = total_slm = total_llm = 0.0
-    total_proposals = 0
+    total_proposals = accepted_proposals = 0
     
     # 1) 准备
     max_total_len = args.max_len + input_ids.shape[1]
@@ -204,7 +212,7 @@ def generate_with_sp(draft_model,
     dsp_throughput = total_tokens / dsp_time
     acceptance_rate = accepted_proposals / total_proposals if total_proposals > 0 else 0.0
     b_ratio  = total_comm / max(total_slm, 1e-4)
-    c_ratio  = dsp_time  / max(total_llm, 1e-4)
+    # c_ratio  = dsp_time  / max(total_llm, 1e-4)
     
 
     generated = tokenizer.decode(prefix[0], skip_special_tokens=True)
@@ -213,35 +221,44 @@ def generate_with_sp(draft_model,
     print(f"Throughput : \033[91m{dsp_throughput}\033[0m", "DSP wall time", dsp_time, "Generated tokens", total_tokens, "Acceptance rate", acceptance_rate )
     print(f"Acceptance rate  : \033[91m{acceptance_rate:.3f}\033[0m  ({accepted_proposals}/{total_proposals})")    
     
-    return generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio, c_ratio
+    return generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio
 
-recorder = Recorder("results_1.3b.csv")
+args = parse_arguments()
+recorder = Recorder(args.csv_path)
 
 if __name__ == "__main__":
     args = parse_arguments()
-    device_1 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device_2 = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+    torch.cuda.empty_cache()  # 清理未使用的显存
+    device_1 = torch.device(args.device_1) 
+    device_2 = torch.device(args.device_2)
     tokenizer = AutoTokenizer.from_pretrained(args.draft_model_name)
     draft_model = AutoModelForCausalLM.from_pretrained(args.draft_model_name)
     target_model = AutoModelForCausalLM.from_pretrained(args.target_model_name)
     input_ids = tokenizer.encode(args.input, return_tensors='pt')
     
     # normal_generate()
-    generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio, c_ratio = generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1='cuda:0', device_2='cuda:1')
+    generated, dsp_throughput, dsp_time, acceptance_rate, b_ratio = generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
     
-    _prefix, t_ar, tp_ar = normal_generate(target_model, tokenizer, input_ids, device='cuda:2')
+    torch.cuda.empty_cache() 
+    _prefix, t_ar_llm, tp_ar_llm = normal_generate(target_model, tokenizer, input_ids, device=device_2)
+    
+    torch.cuda.empty_cache() 
+    _prefix, t_ar_slm, tp_ar_slm = normal_generate(draft_model, tokenizer, input_ids, device=device_1)
     
     recorder.add_entry(
-        model_s = args.draft_model_name,
-        model_l = args.target_model_name,
-        speedup = round(dsp_throughput/tp_ar, 2),
-        b       = round(b_ratio, 3),
-        c       = round(c_ratio, 3),
+        model_s = args.draft_model_name.split('/')[-1],
+        model_l = args.target_model_name.split('/')[-1],
+        speedup = round(dsp_throughput/tp_ar_llm, 2),
+        b       = round(b_ratio, 1),
+        c       = round(t_ar_slm/t_ar_llm, 1),
         accept_rate = round(acceptance_rate, 3),
         dsp_thr = round(dsp_throughput, 2),
-        base_thr= round(tp_ar, 2),
+        base_thr= round(tp_ar_llm, 2),
+        slm_thr = round(tp_ar_slm, 2),
         gamma   = args.gamma,
         rtt_ms  = args.rtt*1e3,
         bw_Mbps = args.bandwidth/1e6,
-        prompt_len = args.max_len
+        prompt_len = args.max_len,
+        t_ar_slm = round(t_ar_slm, 2),
+        t_ar_llm = round(t_ar_llm, 2),
     )
