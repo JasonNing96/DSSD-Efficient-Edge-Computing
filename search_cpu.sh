@@ -9,16 +9,16 @@ SEED=321
 TEMPERATURE=1
 TOP_K=10
 TOP_P=0
-CSV="./results/results_13.b_cpu_H800.csv"
+CSV="./results/results_1.3b_cpu_H800.csv"
 
 # 如果之前有旧结果，就删掉
-[ -f $CSV ] && rm $CSV
+# [ -f $CSV ] && rm $CSV
 
 # 循环参数
-TARGET_MODELS=("./LLM/opt-1.3b" "./LLM/opt-6.7b" "./LLM/opt-13b")
-GAMMAS=(2 4 6 8)
-RTTS=(0.0 0.02 0.05)
-BWS=(10000000 50000000 100000000)
+TARGET_MODELS=("./LLM/opt-6.7b" "./LLM/opt-13b")
+GAMMAS=(4 6)
+RTTS=(0.02)
+BWS=(50000000)
 
 for target_model in "${TARGET_MODELS[@]}"; do
     for gamma in "${GAMMAS[@]}"; do

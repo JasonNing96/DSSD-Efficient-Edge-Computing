@@ -70,7 +70,7 @@ def norm_logits(p : torch.Tensor):
     """
     return F.softmax(p, dim=-1)
 
-def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, max_len : int , gamma : int = 4, temperature : float = 1, top_k : int = 0, top_p : float = 0) -> torch.Tensor:
+def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, target_model : torch.nn.Module, max_len : int , gamma : int = 4, temperature : float = 1, top_k : int = 0, top_p : float = 0, device : str = 'cuda:0') -> torch.Tensor:
     """
     Args:
         x (torch.Tensor): input sequence, (batch, prefix_seqlen), Note that the batch dim is always 1 now.
@@ -86,9 +86,10 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
     """
     seq_len = prefix.shape[1]
     T = seq_len + max_len
-    
     assert prefix.shape[0] == 1, "input batch size must be 1"
-    
+    # ===== 新增：统计 accept/reject 次数 =====
+    accepted_count = 0
+    rejected_count = 0
     t1 = time.time()
     with tqdm(total=T, desc="speculative sampling") as pbar:
         while prefix.shape[1] < T:
@@ -100,34 +101,36 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
                 q = approx_model(x).logits               # 小模型单次生成token的概率分布
                 next_tok = sample(q[:, -1, :], 
                                   temperature, top_k, top_p)
-                x = torch.cat((x, next_tok), dim=1)      # 将小模型生成的token加入到prefix中
+                x = torch.cat((x, next_tok), dim=1)      # 将小模型生成的token加入到prefix中(n,n+1,n+2,...,n+gamma-1)
 
             q = norm_logits(q)                          # 小模型单次生成token的概率分布归一化
             # p  = M_p[prefix + x_0, x_0, .., x_(gamma-1)]
-            p = norm_logits(target_model(x).logits)      # 大模型单次生成token的概率分布
+            p = norm_logits(target_model(x).logits)      # 大模型单次生成token的概率分布(n,n+gama)
 
             # n the end position of the valid prefix
             # x = x_[:prefix_len-1] + x_0, ... x_(gamma-1)
             n = prefix_len + gamma - 1                   # 大模型生成token的结束位置
             for i in range(gamma):                       # 开始确认逻辑
-                r = torch.rand(1)                        # 生成一个随机数
+                r = torch.rand(1).to(device)                        # 生成一个随机数
                 j = x[:, prefix_len + i]                 # 获取大模型生成token的位置
                 # print(f"sum on {prefix_len + i - 1}: {torch.sum(p[:, prefix_len + i - 1, :])}, {torch.sum(q[:, prefix_len + i - 1, :])}")
-
                 if r > (p[:, prefix_len + i - 1, j]) / (q[:, prefix_len + i - 1, j]):
                     n = prefix_len + i - 1
+                    rejected_count += 1
                     break
+                else:
+                    accepted_count += 1
 
 
             # print(f"n : {n}, i : {i}, prefix_len + gamma - 1: {prefix_len + gamma - 1}")
             assert n >= prefix_len - 1, f"n {n}, prefix_len {prefix_len}"
             prefix = x[:, :n + 1]
 
-            if n < prefix_len + gamma - 1:               # 回滚逻辑 
+            if n < prefix_len + gamma - 1:               # 回滚逻辑(有拒绝,被回滚的n)
                 # reject someone, sample from the pos n
                 # print(f"sum on {n}: {torch.sum(p[:, n, :])}, {torch.sum(q[:, n, :])}")
-                t = sample(max_fn(p[:, n, :] - q[:, n, :]), 
-                           temperature, top_k, top_p)
+                t = sample(max_fn(p[:, n, :] - q[:, n, :]),     # 差分q(0:n+gama) -> q(n,n+gama)
+                           temperature, top_k, top_p)           # X1, logist,q1(0,n+q1) 
                 # print(f"reject and sample {n}")
             else:                                        # 所有小模型生成的token都被接受
                 # all draft model decoding accepted
@@ -139,6 +142,12 @@ def speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Module, 
             pbar.update(n - pbar.n)
     t2 = time.time()
     print(f"speculative sampling throughput: {max_len / (t2 - t1)} tokens/s")
+    # ===== 新增：打印 acceptance rate =====
+    total_proposals = accepted_count + rejected_count
+    accept_rate = accepted_count / total_proposals if total_proposals > 0 else 0.0
+    print(f"Acceptance rate: {accept_rate:.3f} "
+          f"({accepted_count}/{total_proposals})")
+    print(f"speculative sampling throughput: {max_len / (t2 - t1):.2f} tokens/s")
     return prefix, t2 - t1
 
 
@@ -234,17 +243,22 @@ def generate(input_text, draft_model_name, target_model_name, max_len=20, verbos
 
 
     torch.manual_seed(seed)
+    sp_text, _  = speculative_sampling(input_ids, small_model, large_model, max_len, gamma = gamma, device=device)
+    generated_text = tokenizer.decode(sp_text[0], skip_special_tokens=True)
+    # print(f"speculative_sampling: {generated_text}")
+    
+    # torch.manual_seed(seed)
     sp_text, sp_time, sp_len, sp_acceptance_rate, sp_throughput = speculative_sampling_with_acceptance_rate(input_ids, small_model, large_model, max_len, gamma = gamma, device=device)
     generated_text = tokenizer.decode(sp_text[0], skip_special_tokens=True)
     # print(f"speculative_sampling: {generated_text}")
     print(f"speculative throughput: \033[91m{sp_throughput}\033[0m")
 
 
-    torch.manual_seed(seed)
-    ag_text, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7, device=device)
-    generated_text = tokenizer.decode(ag_text[0], skip_special_tokens=True)
-    # print(f"autoregressive_sampling: {generated_text}")
-    print(f"autoregressive throughput: \033[91m{ag_throughput}\033[0m")
+    # torch.manual_seed(seed)
+    # ag_text, ag_time, ag_len, ag_throughput = autoregressive_sampling(input_ids, large_model, max_len, top_k = 10, temperature=0.7, device=device)
+    # generated_text = tokenizer.decode(ag_text[0], skip_special_tokens=True)
+    # # print(f"autoregressive_sampling: {generated_text}")
+    # print(f"autoregressive throughput: \033[91m{ag_throughput}\033[0m")
 
     # # torch.manual_seed(seed)
     # agsm_text, agsm_time, agsm_len, agsm_throughput = autoregressive_sampling(input_ids, small_model, max_len, top_k = 10, temperature=0.7, device=device)
@@ -254,14 +268,14 @@ def generate(input_text, draft_model_name, target_model_name, max_len=20, verbos
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='args')
-    parser.add_argument('--input', type=str, default="Alan Turing theorized that computers would one day become ")
-    parser.add_argument('--draft_model_name', type=str, default="./LLM/opt-125m")
-    parser.add_argument('--target_model_name', type=str, default="./LLM/opt-1.3b") 
-    parser.add_argument('--max_len', type=int, default=60) 
+    parser.add_argument('--input', type=str, default="I have 10 apples. I find 3 gold coins in the bottom of a river. The river runs near a big city that has something to do with what I can spend the coins on. ")
+    parser.add_argument('--draft_model_name', type=str, default="./LLM/llama160m/")
+    parser.add_argument('--target_model_name', type=str, default="./LLM/Llama-2-7b/") 
+    parser.add_argument('--max_len', type=int, default=128) 
     parser.add_argument('--verbose', type=bool, default=False)
     parser.add_argument('--seed', type=int, default=321)
     parser.add_argument('--benchmark', type=bool, default=False)
-    parser.add_argument('--gamma', type=int, default=4)
+    parser.add_argument('--gamma', type=int, default=8)
     args = parser.parse_args()
     
-    generate(args.input, args.draft_model_name, args.target_model_name, args.max_len, args.verbose, args.seed, args.benchmark, args.gamma, device='cpu')
+    generate(args.input, args.draft_model_name, args.target_model_name, args.max_len, args.verbose, args.seed, args.benchmark, args.gamma, device='cuda:3')
