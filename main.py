@@ -76,8 +76,8 @@ def draft_step(slm, prefix, gamma, temperature, device, top_k, top_p):
     q_stack = []                 # 用 list 依次 push
     with torch.no_grad():
         for _ in range(gamma):
-            logits = slm(x).logits            # (1, seq, V)
-            q_stack.append(logits[0, -1].cpu())   # 只存最后一行 (V,)
+            logits = slm(x).logits                  # (1, seq, V)
+            q_stack.append(logits[0, -1].cpu())     # 只存最后一行 (V,)
             next_tok = sample(logits[:, -1, :],
                               temperature, top_k, top_p)  # 不做 top-k / top-p
             x = torch.cat((x, next_tok), dim=1)
@@ -169,7 +169,7 @@ def generate_with_sp(draft_model,
             rounds += 1
             # 2.1) UAV 端：草稿 gamma 步
             t0 = time.time()
-            x_draft, q_probs = draft_step(
+            x_draft, q_probs = draft_step(              # 小模型推理，获得X_draft 草稿，q_probs 完整概率分布
                 draft_model, prefix,    
                 args.gamma, args.temperature,
                 device=device_1,

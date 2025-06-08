@@ -13,7 +13,7 @@
                 "--input",
                 "I have 10 apples. I find 3 gold coins in the bottom of a river. The river runs near a big city that has something to do with what I can spend the coins on.",
                 "--draft_model_name", "./LLM/opt-125m/",
-                "--target_model_name", "./LLM/opt-13b/",
+                "--target_model_name", "./LLM/opt-7b/",
                 "--max_len", "128",
                 "--gamma", "6",
                 "--seed", "321",
