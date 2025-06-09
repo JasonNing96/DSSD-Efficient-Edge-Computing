@@ -5,6 +5,51 @@ from torch.nn import functional as F
 import argparse
 import time
 
+# ==== DSSD patch BEGIN ====
+def decompress_logits(compressed_data: bytes, vocab_size: int, k: int = 8) -> torch.Tensor:
+    """
+    将压缩的数据解压为稀疏的 logits
+    """
+    # 1. 解析压缩数据
+    data = torch.frombuffer(compressed_data, dtype=torch.uint8)
+    
+    # 2. 分离索引和概率
+    ids_bytes = data[:k*4]    # int32 索引，4字节 * k
+    prob_bytes = data[k*4:]   # float16 概率，2字节 * k
+    
+    ids = ids_bytes.view(torch.int32).long()
+    probs = prob_bytes.view(torch.float16)
+    
+    # 3. 重构稀疏 logits
+    sparse_logits = torch.full((vocab_size,), float('-inf'))
+    sparse_logits[ids] = torch.log(probs)  # 转回 log 概率
+    
+    return sparse_logits
+def tx_delay_bytes(size_B: int, rtt: float, bw_Bps: float) -> float:
+    """
+    一次上传耗时 = RTT/2 + size / 带宽
+    bw_Bps : Byte / second
+    """
+    return rtt / 2 + size_B / bw_Bps
+
+def compress_logits(logits: torch.Tensor, k: int = 8) -> torch.Tensor:
+    """
+    logits: (V,) 原始 logits → 返回压缩后的张量
+    """
+    top = torch.topk(logits, k=k)
+    ids  = top.indices.to(torch.int32)        # int32 × k (4字节)
+    prob = torch.softmax(top.values, dim=-1).to(torch.float16)  # float16 × k (2字节)
+    
+    # 转换为字节格式的张量并拼接
+    ids_bytes = ids.view(torch.uint8)
+    prob_bytes = prob.view(torch.uint8)
+    
+    # 返回压缩后的张量，而不是 bytes
+    return torch.cat([ids_bytes, prob_bytes])
+
+def tensor_nbytes(t: torch.Tensor) -> int:
+    return t.element_size() * t.numel()
+# ==== DSSD patch END ====
 
 def top_k_top_p_filter(logits, top_k: int = 0, top_p: float = 0.0):
     if top_k > 0:

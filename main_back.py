@@ -1,5 +1,5 @@
 import argparse
-from speculative import autoregressive_sampling, sample, tensor_nbytes, compress_logits, tx_delay_bytes
+from speculative import autoregressive_sampling, sample, calculate_size_np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 from typing import Tuple, List, Dict
@@ -21,7 +21,7 @@ def parse_arguments():
     # parser.add_argument('--benchmark', type=bool, default=False)
     parser.add_argument('--gamma', type=int, default=4)
     parser.add_argument('--rtt', type=float, default=0.02)
-    parser.add_argument('--bandwidth', type=float, default=1000, help='Bandwidth in Mbps')
+    parser.add_argument('--bandwidth', type=float, default=1000)
     parser.add_argument('--temperature', type=float, default=0.7)
     parser.add_argument('--top_k', type=int, default=10)
     parser.add_argument('--top_p', type=float, default=0)
@@ -29,8 +29,6 @@ def parse_arguments():
     parser.add_argument('--device_1', type=str, default="cuda:6")
     parser.add_argument('--device_2', type=str, default="cuda:1")
     parser.add_argument('--device', type=str, default="cuda:0")
-    parser.add_argument('--use_dist_summary', action='store_true', help='upload compressed distribution instead of raw logits')
-    parser.add_argument('--no_cache', action='store_true', help='disable Δ-prompt cache (ablation)')
     return parser.parse_args()
 
 class Recorder:
@@ -58,15 +56,14 @@ class Recorder:
 def transmission_simulator(token_count: int, rtt: float, bandwidth: float, bits_per_token: int = 32) -> float:
     """
     One-way transmission delay: RTT/2 + serialization delay
-    bandwidth: Mbps (Megabits per second)
+    bandwidth: tokens per second
     bits_per_token: bits per token (default is 32 bits)
     """
     # 计算总比特数
     total_bits = token_count * bits_per_token
     
-    # 将 Mbps 转换为 bps，然后计算序列化延迟
-    bandwidth_bps = bandwidth * 1e6  # Mbps → bps
-    serialize = total_bits / bandwidth_bps
+    # 计算序列化延迟
+    serialize = total_bits / (bandwidth * bits_per_token)  # 带宽以 tokens/second 计算
     return rtt / 2 + serialize
 
 def draft_step(slm, prefix, gamma, temperature, device, top_k, top_p):
@@ -85,15 +82,7 @@ def draft_step(slm, prefix, gamma, temperature, device, top_k, top_p):
                               temperature, top_k, top_p)  # 不做 top-k / top-p
             x = torch.cat((x, next_tok), dim=1)
     q_step_logits = torch.stack(q_stack, dim=0)    # -> (γ, V)
-    
-    # ==== DSSD patch BEGIN ====
-    raw_bytes = tensor_nbytes(q_step_logits)
-    if args.use_dist_summary:
-        comp_bytes = sum( tensor_nbytes(compress_logits(row)) for row in q_step_logits )
-        dup_bytes  = comp_bytes
-    else:
-        dup_bytes  = raw_bytes
-    return x, q_step_logits, dup_bytes
+    return x, q_step_logits
 
 
 
@@ -130,61 +119,6 @@ def verify_step(llm, x_draft, q_steps, gamma, temperature, device):
     t_corr    = torch.multinomial(prob_last, 1).unsqueeze(0)  # shape (1,1)
     return n, t_corr, correct_num, reject_num
 
-def verify_step_with_compression(llm, x_draft, q_compressed_list, gamma, temperature, device):
-    """
-    使用压缩的 logits 和增量分布进行验证
-    """
-    correct_num = reject_num = 0
-    prefix_len = x_draft.size(1) - gamma
-    
-    # 1) 大模型一次前向
-    p_all = llm(x_draft.to(device)).logits.cpu()
-    p_slice = p_all[0, prefix_len-1 : prefix_len+gamma-1, :]
-    
-    # 2) 解压缩小模型的预测
-    vocab_size = p_slice.size(-1)
-    q_sparse_logits = []
-    for compressed in q_compressed_list:
-        sparse_logits = decompress_logits(compressed, vocab_size)
-        q_sparse_logits.append(sparse_logits)
-    q_sparse = torch.stack(q_sparse_logits)
-    
-    # 3) 计算增量分布
-    p_probs = F.softmax(p_slice / temperature, dim=-1)
-    q_probs = F.softmax(q_sparse / temperature, dim=-1)
-    
-    # 4) 验证过程
-    for i in range(gamma):
-        tok_id = int(x_draft[0, prefix_len+i].item())
-        
-        # 检查 token 是否在 top-k 中
-        if q_sparse[i, tok_id] == float('-inf'):
-            # Token 不在 top-k 中，直接拒绝
-            n = prefix_len + i - 1
-            # 使用增量分布进行校正采样
-            delta = (p_probs[i] - q_probs[i]).clamp(min=0)
-            delta = delta / delta.sum()
-            t_corr = torch.multinomial(delta, 1).unsqueeze(0)
-            reject_num += 1
-            return n, t_corr, correct_num, reject_num
-        
-        # 正常的接受/拒绝判断
-        if torch.rand(1).item() > (p_probs[i, tok_id] / q_probs[i, tok_id]):
-            n = prefix_len + i - 1
-            delta = (p_probs[i] - q_probs[i]).clamp(min=0)
-            delta = delta / delta.sum()
-            t_corr = torch.multinomial(delta, 1).unsqueeze(0)
-            reject_num += 1
-            return n, t_corr, correct_num, reject_num
-        else:
-            correct_num += 1
-    
-    # 全部接受
-    n = prefix_len + gamma - 1
-    prob_last = F.softmax(p_all[0, n] / temperature, dim=-1)
-    t_corr = torch.multinomial(prob_last, 1).unsqueeze(0)
-    return n, t_corr, correct_num, reject_num
-
 def normal_generate( large_model, tokenizer, input_ids, device):
     print("Baseline autoregressive:")
     input_ids = input_ids.to(device)
@@ -207,12 +141,12 @@ def generate_with_sp(draft_model,
     分布式 Speculative Decoding 核心逻辑，只做投机采样。
     '''
     input_ids = input_ids.to(device_1)
+    args = parse_arguments()
     draft_model = draft_model.to(device_1)
     target_model = target_model.to(device_2)
     
     total_comm = total_slm = total_llm = 0.0
     rounds = correct_nums = reject_nums = 0
-    total_dup_bytes = 0
     
     # 1) 准备
     max_total_len = args.max_len + input_ids.shape[1]
@@ -235,23 +169,23 @@ def generate_with_sp(draft_model,
             rounds += 1
             # 2.1) UAV 端：草稿 gamma 步
             t0 = time.time()
-            x_draft, q_probs, dup_bytes = draft_step(              # 小模型推理，获得X_draft 草稿，q_probs 完整概率分布
+            x_draft, q_probs = draft_step(              # 小模型推理，获得X_draft 草稿，q_probs 完整概率分布
                 draft_model, prefix,    
                 args.gamma, args.temperature,
                 device=device_1,
                 top_k=args.top_k,
                 top_p=args.top_p
             )
-            
-            total_dup_bytes += dup_bytes
+
             # 模拟上行延迟，并累加
-            bw_Bps = args.bandwidth * 1e6 / 8  # Mbps → B/s
-            t_up  = tx_delay_bytes(dup_bytes, rtt, bw_Bps)
-            
+            delta = x_draft.shape[1] - prefix.shape[1]
+            t_up  = transmission_simulator(delta, rtt, bandwidth)
             total_slm += time.time() - t0
             total_comm += t_up
             time.sleep(t_up)
 
+            # 累计 proposal 数
+            # total_proposals += delta
 
             # 2.2) BS 端：验证 + 回滚 + 差分采样 Vertify
             t1 = time.time()
@@ -292,7 +226,7 @@ def generate_with_sp(draft_model,
     print(f"Generated text: \033[91m{generated}\033[0m")
     print(f"Throughput : \033[91m{dsp_throughput}\033[0m", "DSP wall time", dsp_time, "Generated tokens", total_tokens, "Acceptance rate", acceptance_rate) 
     
-    return generated, dsp_throughput, dsp_time, acceptance_rate, total_comm, total_dup_bytes
+    return generated, dsp_throughput, dsp_time, acceptance_rate, total_comm
 
 args = parse_arguments()
 recorder = Recorder(args.csv_path)
@@ -308,7 +242,7 @@ if __name__ == "__main__":
     input_ids = tokenizer.encode(args.input, return_tensors='pt')
     
     # normal_generate()
-    generated, dsp_throughput, dsp_time, acceptance_rate, total_comm, total_dup_bytes = generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
+    generated, dsp_throughput, dsp_time, acceptance_rate, total_comm = generate_with_sp(draft_model, target_model, input_ids, tokenizer, device_1, device_2)
     
     torch.cuda.empty_cache() 
     _prefix, t_ar_llm, tp_ar_llm = normal_generate(target_model, tokenizer, input_ids, device=device_2)
@@ -328,9 +262,8 @@ if __name__ == "__main__":
         slm_thr = round(tp_ar_slm, 2),
         gamma   = args.gamma,
         rtt_ms  = args.rtt*1e3,
-        bw_Mbps = args.bandwidth,
+        bw_Mbps = args.bandwidth/1e6,
         prompt_len = args.max_len,
         t_ar_slm = round(t_ar_slm, 2),
         t_ar_llm = round(t_ar_llm, 2),
-        dup_B    = round(total_dup_bytes / 1024, 1),   # KB
     )
